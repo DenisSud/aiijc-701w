@@ -1,7 +1,7 @@
-# {
-  description = "PyTorch + CUDA dev shell (Python 3.11, ML, LSP, linters)";
+{
+  description = "PyTorch + CUDA dev shell (Python 3.13, ML, LSP, linters)";
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -15,6 +15,7 @@
         python = pkgs.python311;
         pythonEnv = python.withPackages (ps: with ps; [
           pytorch-bin
+          transformers
           numpy
           pandas
           seaborn

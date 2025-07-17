@@ -5,7 +5,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-model_name = "Qwen/Qwen3-1.7B"
+model_name = "Qwen/Qwen3-0.6B"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name, torch_dtype=torch.bfloat16, device_map="auto"
