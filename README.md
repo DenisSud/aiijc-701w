@@ -1,7 +1,7 @@
 # О ПРОЕКТЕ:
 
 Используем:
-- ePytorch, Transformers, TRL, и PEFT (если будут проблемы с ресурсамы, попробуем unsloth)
+- Pytorch, Transformers, TRL, и PEFT (если будут проблемы с ресурсамы, попробуем unsloth)
 
 # ЗАДАЧИ:
 
