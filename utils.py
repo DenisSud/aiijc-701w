@@ -1,142 +1,86 @@
-from openai import OpenAI, RateLimitError
-import re
-from fractions import Fraction
-import os
-from dotenv import load_dotenv
-import time
+import pandas as pd
 import json
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import re
+import ast
 
+def extract_answer(response):
+    """Extract numerical answer from model response, handling structured format."""
+    # First try to extract from <answer> tags
+    answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL | re.IGNORECASE)
+    if answer_match:
+        answer_text = answer_match.group(1).strip()
+    else:
+        # Fallback to full response
+        answer_text = response.lower()
 
-env_path = './.env'
+    # Original extraction patterns
+    patterns = [
+        r"(?:answer is|answer:|final answer:)\s*([+-]?\d+(?:\.\d+)?)",
+        r"\\boxed\{([^}]+)\}",
+        r"\[([^\]]+)\]"
+    ]
 
-try:
-    load_dotenv(env_path)
-    API_KEY = os.environ["OPENROUTER_API_KEY"]
-except KeyError:
-    raise ValueError("OPENROUTER_API_KEY не найден в .env")
-except Exception as e:
-    raise Exception(f"Ошибка при загрузке .env: {e}")
+    for pattern in patterns:
+        matches = re.findall(pattern, answer_text)
+        if matches:
+            try:
+                answer = matches[-1].replace('$', '').replace(',', '')
+                return int(answer) if '.' not in answer else float(answer)
+            except ValueError:
+                continue
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=API_KEY,
-    )
-
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    retry=retry_if_exception_type(RateLimitError)
-)
-def get_answer_from_api(model_name: str, content: str, max_retries=5):
-    prompt = (
-        f"{content}\n\n"
-        "Provide ONLY the final numerical answer without any additional text, explanations or formatting. "
-        "If the solution is an equation, give ONLY the numerical value. "
-        "Example: If the answer is -5, output ONLY: -5"
-    )
-    
-    for attempt in range(max_retries):
+    # Fallback: last number in response
+    numbers = re.findall(r'([+-]?\d+(?:\.\d+)?)', answer_text.split('\n')[-1])
+    if numbers:
         try:
-            completion = client.chat.completions.create(
-                extra_body={},
-                model=model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                timeout=30
-            )
-            result = completion.choices[0].message.content
-            return result
-        except (json.JSONDecodeError, ConnectionError, TimeoutError) as e:
-            wait_time = 2 ** attempt
-            print(f"Ошибка ({type(e).__name__}) на попытке {attempt+1}/{max_retries}: {e}. Жду {wait_time} сек...")
-            print(e)
-            time.sleep(wait_time)
-        except Exception as e:
-            print(f"Критическая ошибка: {type(e).__name__} - {e}")
-            return f"ERROR: {type(e).__name__}"
-    
-    print(f"Не удалось получить ответ после {max_retries} попыток")
-    return "ERROR: MAX_RETRIES_EXCEEDED"
+            num = numbers[-1]
+            return int(num) if '.' not in num else float(num)
+        except ValueError:
+            pass
 
+    return None
 
-def extract_answer(text: str):
-    matches = re.findall(r"-?\d+(?:\.\d+)?", text)
-    
-    if matches:
-        return matches[-1]
-    
-    fraction_match = re.search(r"(\d+)/(\d+)", text) #дробь a/b
-    if fraction_match:
-        numerator, denominator = fraction_match.groups()
-        return float(Fraction(f"{numerator}/{denominator}"))
-    
-    return float(text)
+def create_prompt(task):
+    """Create reasoning prompt that enforces structured output."""
+    return f"""<|im_start|>system
+You are a math expert. Solve this problem step by step.
 
+Structure your response as:
+<thinking>
+[Your step-by-step reasoning here]
+</thinking>
 
-# Модели с Hugging Face
-MODELS = {
-    'deepseek': "deepseek-ai/deepseek-math-7b-base",
-}
+<answer>
+[Just the final numerical answer]
+</answer>
+<|im_end|>
+<|im_start|>user
+{task}
+<|im_end|>
+<|im_start|>assistant
+"""
 
-model_cache = {}
-tokenizer_cache = {}
+def parse_expected_answer(answer_str):
+    """Parse expected answer from string."""
+    try:
+        if answer_str.startswith('[') and answer_str.endswith(']'):
+            return ast.literal_eval(answer_str)
+        return [answer_str]
+    except:
+        return [answer_str]
 
-def load_model(model_id: str):
+def check_correct(extracted, expected_list):
+    """Check if extracted answer matches any expected answer."""
+    if extracted is None:
+        return False
 
-    if model_id not in model_cache:
-        print(f"Загрузка модели и токенизатора для: {model_id}...")
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16, 
-            device_map="auto"    
-        )
-        
-        tokenizer_cache[model_id] = tokenizer
-        model_cache[model_id] = model
-        
-    return tokenizer_cache[model_id], model_cache[model_id]
-
-def get_local_answer(model_id: str, content: str, max_retries=3):
-    prompt = (
-        f"{content}\n\n"
-        "Provide ONLY the final numerical answer without any additional text, explanations or formatting. "
-        "If the solution is an equation, give ONLY the numerical value. "
-        "Example: If the answer is -5, output ONLY: -5\n"
-        "Answer: "
-    )
-    
-    for attempt in range(max_retries):
+    for expected in expected_list:
         try:
-            tokenizer, model = load_model(model_id)
-
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=50,           
-                pad_token_id=tokenizer.eos_token_id,
-                temperature=0.1,                  
-                num_return_sequences=1
-            )
-            
-            full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            result = full_response.replace(prompt, "").strip()
-            
-            return result
-                
-        except Exception as e:
-            print(f"Error: {type(e).__name__} - {e}")
-            return f"ERROR: {type(e).__name__}"
-    
-    print(f"Не удалось получить ответ от модели {model_id} после {max_retries} попыток.")
-    return "ERROR: MAX_RETRIES_EXCEEDED"
+            if extracted == expected:
+                return True
+            if isinstance(extracted, (int, float)) and isinstance(expected, (int, float)):
+                if abs(extracted - expected) < 1e-6:
+                    return True
+        except:
+            continue
+    return False
