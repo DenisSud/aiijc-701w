@@ -1,12 +1,10 @@
-FROM pytorch/pytorch
+FROM vllm/vllm-openai:v0.9.2
 
 # Install dependencies
-RUN pip install --no-cache-dir \
-    vllm==0.4.2 \
-    pandas==2.2.2
+RUN pip install --no-cache-dir -q pandas
 
 # Copy your script
-COPY eval.py /app/math_evaluator.py
+COPY eval.py /app/eval.py
 COPY utils.py /app/utils.py
 COPY data/* /app/data/
 
