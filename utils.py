@@ -6,6 +6,9 @@ from dotenv import load_dotenv
 import time
 import json
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
 
 env_path = './.env'
 
@@ -74,4 +77,66 @@ def extract_answer(text: str):
         numerator, denominator = fraction_match.groups()
         return float(Fraction(f"{numerator}/{denominator}"))
     
-    return text
+    return float(text)
+
+
+# Модели с Hugging Face
+MODELS = {
+    'deepseek': "deepseek-ai/deepseek-math-7b-base",
+}
+
+model_cache = {}
+tokenizer_cache = {}
+
+def load_model(model_id: str):
+
+    if model_id not in model_cache:
+        print(f"Загрузка модели и токенизатора для: {model_id}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16, 
+            device_map="auto"    
+        )
+        
+        tokenizer_cache[model_id] = tokenizer
+        model_cache[model_id] = model
+        
+    return tokenizer_cache[model_id], model_cache[model_id]
+
+def get_local_answer(model_id: str, content: str, max_retries=3):
+    prompt = (
+        f"{content}\n\n"
+        "Provide ONLY the final numerical answer without any additional text, explanations or formatting. "
+        "If the solution is an equation, give ONLY the numerical value. "
+        "Example: If the answer is -5, output ONLY: -5\n"
+        "Answer: "
+    )
+    
+    for attempt in range(max_retries):
+        try:
+            tokenizer, model = load_model(model_id)
+
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=50,           
+                pad_token_id=tokenizer.eos_token_id,
+                temperature=0.1,                  
+                num_return_sequences=1
+            )
+            
+            full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            result = full_response.replace(prompt, "").strip()
+            
+            return result
+                
+        except Exception as e:
+            print(f"Error: {type(e).__name__} - {e}")
+            return f"ERROR: {type(e).__name__}"
+    
+    print(f"Не удалось получить ответ от модели {model_id} после {max_retries} попыток.")
+    return "ERROR: MAX_RETRIES_EXCEEDED"
