@@ -6,8 +6,9 @@ from openai import OpenAI
 # Constants
 TRAIN_DB_PATH = "data/train.db"
 EVALS_DB_PATH = "data/evals.db"
-MODEL_NAME = "qwen3:1.7b"  # Ollama model name
+MODEL_NAME = "qwen3:0.6b"  # Ollama model name
 MAX_PROBLEMS = False
+NUM_WORKERS = 3
 
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
@@ -54,7 +55,7 @@ print(f"Loaded {len(all_tasks)} problems")
 # 2) Connect to evals.db and ensure table exists
 evals_conn = sqlite3.connect(EVALS_DB_PATH)
 evals_cursor = evals_conn.cursor()
-evals_cursor.execute("DROP TABLE IF EXISTS evaluations")
+# evals_cursor.execute("DROP TABLE IF EXISTS evaluations") # This will delete the dataset
 evals_cursor.execute("""
 CREATE TABLE IF NOT EXISTS evaluations (
   eval_id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +81,6 @@ completed_ids = {row[0] for row in evals_cursor.fetchall()}
 for problem_id, task, right_answer in all_tasks:
     if problem_id in completed_ids:
         continue
-
     # — normalize the right_answer into a plain number —
     if isinstance(right_answer, str):
         # try JSON‐loading "[600]" → [600]
@@ -88,7 +88,6 @@ for problem_id, task, right_answer in all_tasks:
             loaded = json.loads(right_answer)
         except json.JSONDecodeError:
             loaded = None
-
         if isinstance(loaded, list) and loaded:
             right_answer = loaded[0]
         elif isinstance(loaded, (int, float)):
@@ -111,29 +110,25 @@ for problem_id, task, right_answer in all_tasks:
     else:
         # already numeric in Python
         right_answer = right_answer
-
     # 4.1) Send the prompt to the LLM
     prompt = f"""
     You are a mathematician. Solve the following problem step by step, and return your reasoning and final answer in JSON format.
-
     The JSON should follow this exact structure:
     {{
       "thinking": [your thinking process for solving the problem],
       "answer": [your final numeric answer as a number, not a string]
     }}
-
     Only return a valid JSON object. Do not include any other text.
-
     Problem:
     {task}
     """
     response = client.chat.completions.create(
         model=MODEL_NAME,
-        temperature=0.3,
+        temperature=0.1,
         messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
         response_format=response_format
     )
-
     # 4.2) Parse the LLM output
     content = response.choices[0].message.content
     try:
@@ -143,10 +138,8 @@ for problem_id, task, right_answer in all_tasks:
     except (json.JSONDecodeError, KeyError):
         thinking = ""
         extracted = None
-
     # 4.3) Determine correctness
     is_correct = (extracted == right_answer)
-
     # 4.4) Insert into evaluations
     evals_cursor.execute(
         """
@@ -163,7 +156,7 @@ for problem_id, task, right_answer in all_tasks:
         )
     )
     evals_conn.commit()
-    print(f"The answer is {is_correct}")
+    print(f"P{problem_id} {is_correct}")
 
 # 5) Compute and print summary for this model
 evals_cursor.execute(
