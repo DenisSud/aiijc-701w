@@ -4,15 +4,21 @@ from openai import OpenAI
 
 # Constants
 DATASET_PATH = "data/train.csv"
-MODEL_NAME = "qwen3:0.6b"  # Ollama model name
+MODEL_NAME = "qwen/qwen3-4b:free"  # Ollama model name
 MAX_PROBLEMS = 100
-OUTPUT_FILE = "results.json"
-OLLAMA_BASE_URL = "http://localhost:11434/v1"  # Default Ollama OpenAI-compatible endpoint
+OUTPUT_FILE = f"evals/{MODEL_NAME.split('/')[-1].split(':')[0]}.json"
+print(OUTPUT_FILE)
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Initialize Ollama client
+# Read your API key from the environment
+OPENROUTER_API_KEY = "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"
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("Please set the OPENROUTER_API_KEY environment variable")
+
+# Initialize OpenRouter client (OpenAI-compatible)
 client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key="ollama",  # Ollama doesn't need a real API key
+    base_url=OPENROUTER_BASE_URL,
+    api_key=OPENROUTER_API_KEY,
 )
 
 # Load data
@@ -51,11 +57,9 @@ correct = 0
 
 print("Processing problems...")
 for i, (_, row) in enumerate(df.iterrows()):
-    if i % 10 == 0:
-        print(f"Progress: {i}/{len(df)}")
-    
+    print(f"Progress: {i}/{len(df)}")
+
     try:
-        # Generate response with structured output
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
@@ -70,27 +74,28 @@ for i, (_, row) in enumerate(df.iterrows()):
             ],
             response_format=response_format,
             temperature=0.1,
-            max_tokens=1024
+            max_tokens=4096
         )
-        
+
         # Parse structured response
-        response_data = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        response_data = json.loads(content)
         extracted = response_data.get("answer")
         thinking = response_data.get("thinking", "")
-        
+
     except Exception as e:
         print(f"Error processing problem {i}: {e}")
         extracted = None
         thinking = ""
         response_data = {}
-    
+
     # Evaluate result
     expected = parse_expected_answer(row['answer'])
     is_correct = check_correct(extracted, expected)
-    
+
     if is_correct:
         correct += 1
-    
+
     results.append({
         "task": row['task'],
         "expected": expected,
