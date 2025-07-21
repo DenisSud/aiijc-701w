@@ -24,38 +24,38 @@ This should be approximately ~2000 training steps.
 # Simple implementation
 import re
 from fractions import Fraction
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from trl import GRPOTrainer, GRPOConfig
+from unsloth import FastLanguageModel
+from vllm import SamplingParams
+from trl import GRPOConfig, GRPOTrainer
 from datasets import load_dataset
+import torch
+
+torch.cuda.empty_cache()
 
 # Configuration
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 DATA_PATH = "/content/train.csv"
 OUTPUT_DIR = "grpo_math_model"
 
-# 1. Load your dataset from a local CSV
 dataset = load_dataset(
     "csv",
     data_files={"train": DATA_PATH},
     split="train"
 )
 
-# 2. Preprocess: add reasoning instruction to each task
 def add_instruction(example):
     example["prompt"] = (
+        "Please solve the following problem step by step:\n"
         f"Problem: {example['task'].strip()}\n\n"
-        "Please solve this step by step:\n"
         "1. First, understand what is being asked\n"
         "2. Show your reasoning\n"
         "3. Provide your final answer in brackets like [52]\n\n"
-        "Your response should end with your final numerical answer in brackets."
+        "Your response should end with your final numerical answer in brackets with no other characters."
     )
     return example
 
 dataset = dataset.map(add_instruction)
 
-# 3. Define parse and reward functions
 def parse_answer(s):
     """Extracts answer from various formats, returns float."""
     if s is None:
@@ -78,9 +78,6 @@ def parse_answer(s):
             val = match.group(1).strip()
             break
     else:
-        return None
-
-    if val.lower() in ['answer', 'solution', '']:
         return None
 
     try:
@@ -122,30 +119,69 @@ def reward_func(prompts, completions, **kwargs):
             rewards.append(-abs(pred - true_val))
     return rewards
 
-# 5. Initialize model and tokenizer
-model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+max_seq_length = 4096 # Can increase for longer reasoning traces
+lora_rank = 32 # Larger rank = smarter, but slower
 
-# 4. Configure GRPO training arguments
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "unsloth/Qwen3-4B-Base",
+    max_seq_length = max_seq_length,
+    load_in_4bit = False, # False for LoRA 16bit
+    fast_inference = True, # Enable vLLM fast inference
+    gpu_memory_utilization = 0.7, # Reduce if out of memory
+    # max_lora_rank = lora_rank,
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = lora_rank, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+    target_modules = [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    lora_alpha = lora_rank*2, # *2 speeds up training
+    use_gradient_checkpointing = "unsloth", # Reduces memory usage
+    random_state = 3407,
+)
+
+# finds the longest prompt in the train.csv
+maximum_length = max(len(row["prompt"]) for row in dataset)
+
+max_prompt_length = maximum_length + 1 # + 1 just in case!
+max_completion_length = max_seq_length - max_prompt_length
+
+vllm_sampling_params = SamplingParams(
+    min_p = 0.1,
+    top_p = 1.0,
+    top_k = -1,
+    seed = 701,
+    stop = [tokenizer.eos_token],
+    include_stop_str_in_output = True,
+)
+
 training_args = GRPOConfig(
-    output_dir=OUTPUT_DIR,
-    num_train_epochs=4,
-    per_device_train_batch_size=8,
-    gradient_accumulation_steps=1,
-    learning_rate=1e-5,
-    logging_steps=10,
-    temperature= 0.6,
-    top_p= 0.95,
+    vllm_sampling_params = vllm_sampling_params,
+    temperature = 1.0,
+    learning_rate = 5e-6,
+    weight_decay = 0.01,
+    warmup_ratio = 0.1,
+    lr_scheduler_type = "linear",
+    optim = "adamw_8bit",
+    logging_steps = 1,
+    per_device_train_batch_size = 1,
+    gradient_accumulation_steps = 1, # Increase to 4 for smoother training
+    num_generations = 4, # Decrease if out of memory
+    max_prompt_length = max_prompt_length,
+    max_completion_length = max_completion_length,
+    # num_train_epochs = 1, # Set to 1 for a full training run
+    max_steps = 100,
+    save_steps = 100,
+    report_to = "wandb", # Can use Weights & Biases
+    output_dir = "outputs",
+
+    # For optional training + evaluation
+    fp16_full_eval = True,
+    per_device_eval_batch_size = 4,
+    eval_accumulation_steps = 1,
+    eval_strategy = "steps",
+    eval_steps = 1,
 )
-
-# 6. Initialize GRPOTrainer and train
-trainer = GRPOTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=dataset,
-    reward_funcs=reward_func,
-)
-
-trainer.train()
-
-print("GRPO training complete!")
