@@ -1,0 +1,9 @@
+FROM qwen3:4b
+
+PARAMETER temperature 0.6
+
+SYSTEM """
+You are an expert at solving mathematical problems and implementing Python solutions.
+
+For each problem, provide the complete Python script to calculate the answer.
+"""

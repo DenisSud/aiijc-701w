@@ -1,18 +1,8 @@
-# Pure math training script (inspired by deepscalar)
+# Pure math training script (improved)
 """
-Reinforcement Learning (RL) stage
-
-Here the model will be trained via GRPO with accuracy based reward functions.
-
-TODO:
-Since smaller models generally need more context length to reason to reach the same performance as larger models, we will iteratively increase the context length.
-For the first training run the context length will be set to 4096, when the model tries to exceed the context length >2% of the time, we will increase the context length by 4096 and continue training.
-We will repeat this pattern until the context length reaches a maximum of 12228 tokens.
-
-This should be approximately ~2000 training steps.
+Reinforcement Learning (RL) stage with better reward functions and comprehensive metrics tracking
 """
 
-# Simple implementation
 import re
 from fractions import Fraction
 from unsloth import FastLanguageModel
@@ -20,6 +10,9 @@ from vllm import SamplingParams
 from trl import GRPOConfig, GRPOTrainer
 from datasets import load_dataset
 import torch
+import wandb
+from collections import defaultdict
+import numpy as np
 
 torch.cuda.empty_cache()
 
@@ -27,8 +20,12 @@ torch.cuda.empty_cache()
 MODEL_NAME = "Qwen/Qwen3-1.7B"
 DATA_PATH = "/content/train.csv"
 OUTPUT_DIR = "grpo_math_model"
-TEMPERATURE = 0.6
+TRAINING_TEMPERATURE = 1.0  # Fixed temperature
+MAX_SEQ_LENGTH = 4096
+LORA_RANK = 32
 
+# Global metrics tracking
+training_metrics = defaultdict(list)
 
 dataset = load_dataset(
     "csv",
@@ -38,111 +35,244 @@ dataset = load_dataset(
 
 def add_instruction(example):
     example["prompt"] = (
-        "jlease solve the following problem step by step:\n"
+        "Please solve the following problem step by step:\n"
         f"Problem: {example['task'].strip()}\n\n"
-        "1. First, understand what is being asked\n"
-        "2. Show your reasoning\n"
-        "3. Provide your final answer in brackets like [52]\n\n"
-        "Your response should end with your final numerical answer in brackets with no other characters."
+        "Show your reasoning inside <thinking> tags, then provide your final numerical answer in brackets like [52].\n"
+        "Format: <thinking>your reasoning here</thinking>[answer]"
     )
     return example
 
 dataset = dataset.map(add_instruction)
 
-def parse_answer(s):
-    """Extracts answer from various formats, returns float."""
-    if s is None:
-        return None
+# Create a lookup dictionary for faster access
+dataset_lookup = {example["prompt"]: example for example in dataset}
 
-    s = str(s)
+def parse_answer(s):
+    """Extracts answer from various formats, returns float or None."""
+    if s is None:
+        return None, "none_input"
+
+    s = str(s).strip()
 
     # Try different answer formats in order of preference
     patterns = [
-        r"\[(\d+(?:\.\d+)?)\]",           # [52] format
-        r"\\boxed\{(\d+(?:\.\d+)?)\}",    # \boxed{52} format
-        r"boxed\{(\d+(?:\.\d+)?)\}",      # boxed{52} format
-        r"answer is (\d+(?:\.\d+)?)",     # "answer is 52"
-        r"(\d+(?:\.\d+)?)(?:\s*$|\s*\n)", # number at end
+        (r"\[(\d+(?:\.\d+)?)\]", "bracket_format"),           
+        (r"\\boxed\{(\d+(?:\.\d+)?)\}", "latex_boxed"),    
+        (r"boxed\{(\d+(?:\.\d+)?)\}", "boxed_format"),      
+        (r"answer is (\d+(?:\.\d+)?)", "answer_is"),     
+        (r"(\d+(?:\.\d+)?)(?:\s*$|\s*\n)", "number_at_end"), 
     ]
 
-    for pattern in patterns:
+    for pattern, format_type in patterns:
         match = re.search(pattern, s, re.IGNORECASE)
         if match:
             val = match.group(1).strip()
             break
     else:
-        return None
+        return None, "no_match_found"
 
     try:
-        return float(val)
+        return float(val), format_type
     except ValueError:
         try:
-            return float(Fraction(val))
+            return float(Fraction(val)), f"{format_type}_fraction"
         except (ValueError, ZeroDivisionError):
-            return None
+            return None, "parse_error"
 
-def reward_func(prompts, completions, **kwargs):
-    """Reward based on negative absolute error to true answer."""
+def check_format(prompts, completions, **kwargs):
+    """
+    Simple format checker:
+    1. Must contain <thinking> tags
+    2. Must have numeric answer in brackets [number]
+    3. No other characters outside thinking tags and square brackets
+    
+    Returns 1.0 for correct format, 0.0 for incorrect format.
+    """
     rewards = []
+    
     for prompt, completion in zip(prompts, completions):
-        # Extract the answer from the original dataset by finding the example
-        # that matches this prompt
-        matching_example = None
-        for example in dataset:
-            if example["prompt"] == prompt:
-                matching_example = example
-                break
-
-        if matching_example is None:
-            rewards.append(-1.0)
+        if completion is None or len(completion.strip()) == 0:
+            training_metrics["format_empty_completions"].append(1)
+            rewards.append(0.0)
             continue
-
-        # Debug: print what we're trying to parse
-        print(f"Raw answer from dataset: {repr(matching_example['answer'])}")
-        print(f"Completion: {repr(completion[:100])}...")  # First 100 chars
-
-        true_val = parse_answer(matching_example["answer"])
-        pred = parse_answer(completion)
-
-        print(f"Parsed true_val: {true_val}, pred: {pred}")
-
-        if pred is None or true_val is None:
-            rewards.append(-1.0)
-        else:
-            rewards.append(-abs(pred - true_val))
+            
+        training_metrics["format_empty_completions"].append(0)
+        completion = completion.strip()
+        
+        # Check 1: Must contain <thinking> tags
+        has_thinking_open = re.search(r'<thinking>', completion) is not None
+        has_thinking_close = re.search(r'</thinking>', completion) is not None
+        
+        training_metrics["has_thinking_tags"].append(int(has_thinking_open and has_thinking_close))
+        
+        if not (has_thinking_open and has_thinking_close):
+            rewards.append(0.0)
+            continue
+            
+        # Check 2: Must have numeric answer in brackets
+        bracket_match = re.search(r'\[(\d+(?:\.\d+)?)\]', completion)
+        training_metrics["has_bracket_answer"].append(int(bracket_match is not None))
+        
+        if not bracket_match:
+            rewards.append(0.0)
+            continue
+            
+        # Check 3: Remove thinking tags and bracketed answer, check if anything else remains
+        without_thinking = re.sub(r'<thinking>.*?</thinking>', '', completion, flags=re.DOTALL)
+        without_answer = re.sub(r'\[\d+(?:\.\d+)?\]', '', without_thinking)
+        
+        has_extra_content = bool(without_answer.strip())
+        training_metrics["has_extra_content"].append(int(has_extra_content))
+        
+        if has_extra_content:
+            rewards.append(0.0)
+            continue
+            
+        # All checks passed
+        rewards.append(1.0)
+    
     return rewards
 
-max_seq_length = 4096 # Can increase for longer reasoning traces
-lora_rank = 32 # Larger rank = smarter, but slower
+def check_answer(prompts, completions, **kwargs):
+    """
+    Binary accuracy reward: 1.0 if answer matches exactly, 0.0 otherwise.
+    Also tracks comprehensive metrics.
+    """
+    rewards = []
+    
+    for prompt, completion in zip(prompts, completions):
+        # Get true answer from dataset lookup
+        example = dataset_lookup.get(prompt)
+        if example is None:
+            training_metrics["dataset_lookup_failures"].append(1)
+            rewards.append(0.0)
+            continue
+        
+        training_metrics["dataset_lookup_failures"].append(0)
+        
+        # Track response length metrics
+        completion_length = len(completion) if completion else 0
+        word_count = len(completion.split()) if completion else 0
+        training_metrics["completion_lengths"].append(completion_length)
+        training_metrics["completion_word_counts"].append(word_count)
+        
+        # Track context usage
+        prompt_length = len(prompt)
+        total_length = prompt_length + completion_length
+        training_metrics["prompt_lengths"].append(prompt_length)
+        training_metrics["total_sequence_lengths"].append(total_length)
+        training_metrics["context_utilization_ratio"].append(total_length / MAX_SEQ_LENGTH)
+        
+        # Check for potential context overflow
+        context_overflow = total_length > MAX_SEQ_LENGTH * 0.95  # 95% threshold
+        training_metrics["context_near_overflow"].append(int(context_overflow))
+        
+        # Parse answers and track parsing success
+        true_val, true_parse_type = parse_answer(example["answer"])
+        pred_val, pred_parse_type = parse_answer(completion)
+        
+        training_metrics["true_answer_parse_success"].append(int(true_val is not None))
+        training_metrics["pred_answer_parse_success"].append(int(pred_val is not None))
+        training_metrics["pred_parse_types"].append(pred_parse_type)
+        
+        # Track parsing errors
+        if true_val is None:
+            training_metrics["true_answer_parse_errors"].append(1)
+            rewards.append(0.0)
+            continue
+        
+        training_metrics["true_answer_parse_errors"].append(0)
+        
+        if pred_val is None:
+            training_metrics["pred_answer_parse_errors"].append(1)
+            rewards.append(0.0)
+            continue
+            
+        training_metrics["pred_answer_parse_errors"].append(0)
+        
+        # Binary accuracy check
+        is_correct = abs(pred_val - true_val) < 1e-6  # Float comparison with tolerance
+        training_metrics["answer_accuracy"].append(int(is_correct))
+        
+        # Track error magnitudes for analysis (even though not used in reward)
+        error_magnitude = abs(pred_val - true_val)
+        training_metrics["answer_error_magnitudes"].append(error_magnitude)
+        
+        # Categorize error types
+        if error_magnitude == 0:
+            training_metrics["error_categories"].append("exact_match")
+        elif error_magnitude < 1:
+            training_metrics["error_categories"].append("small_error")
+        elif error_magnitude < 10:
+            training_metrics["error_categories"].append("medium_error")
+        else:
+            training_metrics["error_categories"].append("large_error")
+        
+        rewards.append(1.0 if is_correct else 0.0)
+    
+    return rewards
 
+def log_batch_metrics():
+    """Log aggregated metrics to wandb after each batch"""
+    if not training_metrics:
+        return
+        
+    # Aggregate metrics
+    aggregated = {}
+    
+    for metric_name, values in training_metrics.items():
+        if not values:
+            continue
+            
+        if metric_name in ["pred_parse_types", "error_categories"]:
+            # Handle categorical metrics
+            from collections import Counter
+            counter = Counter(values)
+            for category, count in counter.items():
+                aggregated[f"{metric_name}_{category}"] = count / len(values)
+        else:
+            # Handle numerical metrics
+            values_array = np.array(values)
+            aggregated[f"{metric_name}_mean"] = values_array.mean()
+            aggregated[f"{metric_name}_std"] = values_array.std()
+            if metric_name in ["completion_lengths", "completion_word_counts", "total_sequence_lengths"]:
+                aggregated[f"{metric_name}_max"] = values_array.max()
+                aggregated[f"{metric_name}_min"] = values_array.min()
+    
+    # Log to wandb
+    wandb.log(aggregated)
+    
+    # Clear metrics for next batch
+    training_metrics.clear()
+
+# Model setup (unchanged)
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name = "unsloth/Qwen3-4B-Base",
-    max_seq_length = max_seq_length,
-    load_in_4bit = False, # False for LoRA 16bit
-    fast_inference = True, # Enable vLLM fast inference
-    gpu_memory_utilization = 0.7, # Reduce if out of memory
-    # max_lora_rank = lora_rank,
+    max_seq_length = MAX_SEQ_LENGTH,
+    load_in_4bit = False,
+    fast_inference = True,
+    gpu_memory_utilization = 0.7,
 )
 
 model = FastLanguageModel.get_peft_model(
     model,
-    r = lora_rank, # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+    r = LORA_RANK,
     target_modules = [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
     ],
-    lora_alpha = lora_rank*2, # *2 speeds up training
-    use_gradient_checkpointing = "unsloth", # Reduces memory usage
+    lora_alpha = LORA_RANK*2,
+    use_gradient_checkpointing = "unsloth",
     random_state = 3407,
 )
 
-# finds the longest prompt in the train.csv
+# Calculate lengths
 maximum_length = max(len(row["prompt"]) for row in dataset)
-
-max_prompt_length = maximum_length + 1 # + 1 just in case!
-max_completion_length = max_seq_length - max_prompt_length
+max_prompt_length = maximum_length + 1
+max_completion_length = MAX_SEQ_LENGTH - max_prompt_length
 
 vllm_sampling_params = SamplingParams(
+    temperature = TRAINING_TEMPERATURE,  # Fixed to 1.0
     min_p = 0.1,
     top_p = 1.0,
     top_k = -1,
@@ -153,7 +283,7 @@ vllm_sampling_params = SamplingParams(
 
 training_args = GRPOConfig(
     vllm_sampling_params = vllm_sampling_params,
-    temperature = 1.0,
+    temperature = TRAINING_TEMPERATURE,
     learning_rate = 5e-6,
     weight_decay = 0.01,
     warmup_ratio = 0.1,
@@ -161,17 +291,14 @@ training_args = GRPOConfig(
     optim = "adamw_8bit",
     logging_steps = 1,
     per_device_train_batch_size = 1,
-    gradient_accumulation_steps = 1, # Increase to 4 for smoother training
-    num_generations = 4, # Decrease if out of memory
+    gradient_accumulation_steps = 1,
+    num_generations = 4,
     max_prompt_length = max_prompt_length,
     max_completion_length = max_completion_length,
-    # num_train_epochs = 1, # Set to 1 for a full training run
     max_steps = 100,
     save_steps = 100,
-    report_to = "wandb", # Can use Weights & Biases
+    report_to = "wandb",
     output_dir = "outputs",
-
-    # For optional training + evaluation
     fp16_full_eval = True,
     per_device_eval_batch_size = 4,
     eval_accumulation_steps = 1,
@@ -179,23 +306,26 @@ training_args = GRPOConfig(
     eval_steps = 1,
 )
 
-# For optional training + evaluation
-# new_dataset = dataset.train_test_split(test_size = 0.01)
+# Custom trainer class to add metrics logging
+class MetricsGRPOTrainer(GRPOTrainer):
+    def log_batch_metrics(self):
+        log_batch_metrics()
 
-trainer = GRPOTrainer(
+trainer = MetricsGRPOTrainer(
     model = model,
     processing_class = tokenizer,
     reward_funcs = [
-        match_format_exactly,
-        match_format_approximately,
+        check_format,
         check_answer,
-        check_numbers,
     ],
     args = training_args,
     train_dataset = dataset,
-
-    # For optional training + evaluation
-    # train_dataset = new_dataset["train"],
-    # eval_dataset = new_dataset["test"],
 )
+
+# Add callback to log metrics after each batch
+class MetricsCallback:
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        log_batch_metrics()
+
+trainer.add_callback(MetricsCallback())
 trainer.train()
