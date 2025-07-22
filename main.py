@@ -185,3 +185,24 @@ training_args = GRPOConfig(
     eval_strategy = "steps",
     eval_steps = 1,
 )
+
+# For optional training + evaluation
+# new_dataset = dataset.train_test_split(test_size = 0.01)
+
+trainer = GRPOTrainer(
+    model = model,
+    processing_class = tokenizer,
+    reward_funcs = [
+        match_format_exactly,
+        match_format_approximately,
+        check_answer,
+        check_numbers,
+    ],
+    args = training_args,
+    train_dataset = dataset,
+
+    # For optional training + evaluation
+    # train_dataset = new_dataset["train"],
+    # eval_dataset = new_dataset["test"],
+)
+trainer.train()
