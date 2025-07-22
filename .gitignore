@@ -1,3 +1,5 @@
 .env
 __pycache__
 models/
+configuration/config.py
+configuration/__pycache__
