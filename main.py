@@ -1,13 +1,4 @@
-# Main training script
-"""
-Supervised Finetuning (Priming) stage
-
-# TODO
-The model will go through standard instruction fine tuning.
-The dataset has been artificially generated using a subset of the original dataset and a larger,
-more trust worthy model (deepseek-r1-0528) that generated the reasoning and answers.
-"""
-
+# Pure math training script (inspired by deepscalar)
 """
 Reinforcement Learning (RL) stage
 
@@ -33,9 +24,11 @@ import torch
 torch.cuda.empty_cache()
 
 # Configuration
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen3-1.7B"
 DATA_PATH = "/content/train.csv"
 OUTPUT_DIR = "grpo_math_model"
+TEMPERATURE = 0.6
+
 
 dataset = load_dataset(
     "csv",
@@ -45,7 +38,7 @@ dataset = load_dataset(
 
 def add_instruction(example):
     example["prompt"] = (
-        "Please solve the following problem step by step:\n"
+        "jlease solve the following problem step by step:\n"
         f"Problem: {example['task'].strip()}\n\n"
         "1. First, understand what is being asked\n"
         "2. Show your reasoning\n"
