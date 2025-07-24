@@ -1,5 +1,6 @@
 .env
 __pycache__
+temp.ipynb
 models/
 configuration/config.py
 configuration/__pycache__
