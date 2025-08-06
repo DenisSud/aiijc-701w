@@ -9,7 +9,6 @@ import sqlitecloud
 
 DetectorFactory.seed = 0
 
-
 class Data:
     def __init__(self, db_path: str = None, cloud_path: str = None):
         if db_path:
@@ -63,7 +62,7 @@ class Data:
             else:
                 test_df.to_sql("test", self.conn, if_exists="replace", index=False)
 
-    def insert_df_to_cloud(self, df, table_name):
+    def _insert_df_to_cloud(self, df, table_name):
         """Вспомогательный метод для вставки данных в SQLiteCloud"""
         try:
             self.cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
@@ -137,19 +136,17 @@ class Data:
         except sqlite3.OperationalError:
             pass
 
-    def get_data_for_translation_filtered(
-        self,
-        table_name: str = "train",
-        source_column: str = "task",
-        target_column: str = None,
-    ) -> list:
+    def get_data_for_translation(self, table_name: str = "train", 
+                                             source_column: str = "task",
+                                             target_column: str = None) -> list:
+        """Получает данные для перевода вместе с языком оригинального текста"""
         if target_column:
-            query = f"""SELECT id, {source_column} FROM {table_name} 
+            query = f"""SELECT id, {source_column}, language FROM {table_name} 
                        WHERE {source_column} IS NOT NULL 
                        AND ({target_column} IS NULL OR {target_column} = '')"""
         else:
-            query = f"SELECT id, {source_column} FROM {table_name} WHERE {source_column} IS NOT NULL"
-
+            query = f"SELECT id, {source_column}, language FROM {table_name} WHERE {source_column} IS NOT NULL"
+        
         self.cursor.execute(query)
         return self.cursor.fetchall()
 
@@ -271,7 +268,7 @@ class Data:
 
     def execute(self, query: str):
         return self.cursor.execute(query, self.conn)
-
+    
 
 def main():
     data_manager = Data()
@@ -281,3 +278,5 @@ def main():
     print("Определение языков...")
     data_manager.add_language_column()
     data_manager.detect_languages()
+
+#main()
