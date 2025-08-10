@@ -1,0 +1,10 @@
+pandas
+sqlitecloud
+langdetect
+openai
+matplotlib
+seaborn
+transformers
+torch
+numpy
+accelerate
